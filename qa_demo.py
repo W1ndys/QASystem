@@ -72,26 +72,40 @@ def main():
         elif choice == "5":
             print("批量添加问答对")
             print("请选择输入方式：")
-            print("1. 手动输入多个问答对")
+            print("1. 一次性输入所有问答对")
             print("2. 从JSON文件导入")
 
             input_choice = input("请选择 (1-2): ")
 
             if input_choice == "1":
+                print("请一次性输入所有问答对，格式为：")
+                print("问题1####答案1")
+                print("问题2####答案2")
+                print("...")
+                print("使用'####'作为问题和答案的分隔符")
+                print("输入空行完成添加")
+
                 qa_list = []
+                print("请输入所有问答对(输入空行结束):")
                 while True:
-                    question = input("请输入问题 (输入空行结束): ")
-                    if not question:
+                    line = input()
+                    if not line:
                         break
 
-                    answer = input("请输入答案: ")
-                    qa_list.append({"question": question, "answer": answer})
-
-                    print(f"已添加问答对，当前共 {len(qa_list)} 个")
+                    parts = line.split("####")
+                    if len(parts) == 2:
+                        question, answer = parts
+                        qa_list.append(
+                            {"question": question.strip(), "answer": answer.strip()}
+                        )
+                    else:
+                        print(f"格式错误: {line}，已跳过")
 
                 if qa_list:
                     added_ids = qa_system.batch_add_qa(qa_list)
-                    print(f"成功添加 {len(added_ids)} 个问答对")
+                    print(f"成功批量添加 {len(added_ids)} 个问答对")
+                else:
+                    print("未添加任何问答对")
 
             elif input_choice == "2":
                 file_path = input("请输入JSON文件路径: ")
@@ -121,7 +135,8 @@ def main():
                 print(f"ID: {qa['id']}, 问题: {qa['question']}")
 
             print("\n批量删除问答对")
-            print("请输入要删除的问答对ID，多个ID之间用逗号分隔")
+            print("请一次性输入所有要删除的ID，以逗号分隔")
+            print("例如: 1,3,5,7")
             id_input = input("要删除的ID: ")
 
             try:
@@ -133,10 +148,10 @@ def main():
 
                 if id_list:
                     deleted_ids = qa_system.batch_delete_qa(id_list)
-                    print(f"成功删除 {len(deleted_ids)} 个问答对")
+                    print(f"成功批量删除 {len(deleted_ids)} 个问答对")
                     if len(deleted_ids) < len(id_list):
                         not_found = set(id_list) - set(deleted_ids)
-                        print(f"未找到ID: {', '.join(map(str, not_found))}")
+                        print(f"未找到的ID: {', '.join(map(str, not_found))}")
                 else:
                     print("未输入有效的ID")
 
