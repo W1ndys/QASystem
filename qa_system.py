@@ -1,187 +1,103 @@
-import json
-import os
-import jieba
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 import difflib
+from collections import defaultdict
+import jieba
+from db_manager import QADatabaseManager
+import scipy.sparse
+from typing import Optional
 
 
-class QASystem:
-    def __init__(self, data_file="qa_data.json"):
-        self.data_file = data_file
-        self.qa_data = self._load_data()
+class AdvancedQAMatcher:
+    def __init__(self):
+        self.qa_pairs = []
+        self.vectorizer = TfidfVectorizer(tokenizer=self._tokenize)
+        self.tfidf_matrix: Optional[scipy.sparse.csr_matrix] = None
+        self.keyword_index = defaultdict(list)
+        self.db = QADatabaseManager()
+        self._load_from_db()
 
-    def _load_data(self):
-        """加载问答数据"""
-        if os.path.exists(self.data_file):
-            try:
-                with open(self.data_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except:
-                return {"questions": []}
-        else:
-            return {"questions": []}
+    def _load_from_db(self):
+        # 从数据库加载所有QA对
+        self.qa_pairs = [(q, a) for _, q, a in self.db.get_all_qa_pairs()]
 
-    def _save_data(self):
-        """保存问答数据"""
-        with open(self.data_file, "w", encoding="utf-8") as f:
-            json.dump(self.qa_data, f, ensure_ascii=False, indent=2)
+    def _tokenize(self, text):
+        text = text.lower()
+        tokens = list(jieba.cut(text))
+        return [t for t in tokens if t.strip()]
 
-    def add_qa(self, question, answer, keywords=None):
-        """添加问题和答案"""
-        if keywords is None:
-            # 自动提取关键词
-            keywords = self._extract_keywords(question)
+    def add_qa_pair(self, question, answer):
+        self.qa_pairs.append((question, answer))
+        self.db.add_qa_pair(question, answer)
 
-        qa_item = {
-            "id": len(self.qa_data["questions"]) + 1,
-            "question": question,
-            "answer": answer,
-            "keywords": keywords,
-        }
+    def build_index(self):
+        # 构建TF-IDF索引
+        questions = [q for q, a in self.qa_pairs]
+        self.tfidf_matrix = self.vectorizer.fit_transform(questions).tocsr()  # type: ignore
 
-        self.qa_data["questions"].append(qa_item)
-        self._save_data()
-        return qa_item["id"]
+        # 构建关键词倒排索引
+        self.keyword_index.clear()
+        for idx, (q, a) in enumerate(self.qa_pairs):
+            keywords = set(self._tokenize(q))
+            for word in keywords:
+                self.keyword_index[word].append(idx)
 
-    def batch_add_qa(self, qa_list):
-        """批量添加问答对
+    def _get_candidate_indices(self, query):
+        # 使用关键词索引初步筛选候选问题
+        query_keywords = set(self._tokenize(query))
+        candidate_indices = set()
 
-        Args:
-            qa_list: 包含多个问答对的列表，每个问答对是一个字典，包含question和answer字段
+        for word in query_keywords:
+            if word in self.keyword_index:
+                candidate_indices.update(self.keyword_index[word])
 
-        Returns:
-            添加的问答对ID列表
-        """
-        added_ids = []
-        for qa_item in qa_list:
-            question = qa_item.get("question", "")
-            answer = qa_item.get("answer", "")
-
-            if question and answer:
-                qa_id = self.add_qa(question, answer)
-                added_ids.append(qa_id)
-
-        return added_ids
-
-    def delete_qa(self, qa_id):
-        """删除问题和答案"""
-        for i, item in enumerate(self.qa_data["questions"]):
-            if item["id"] == qa_id:
-                self.qa_data["questions"].pop(i)
-                self._save_data()
-                return True
-        return False
-
-    def batch_delete_qa(self, id_list):
-        """批量删除问答对
-
-        Args:
-            id_list: 要删除的问答对ID列表
-
-        Returns:
-            成功删除的ID列表
-        """
-        deleted_ids = []
-        for qa_id in id_list:
-            if self.delete_qa(qa_id):
-                deleted_ids.append(qa_id)
-
-        return deleted_ids
-
-    def _extract_keywords(self, text):
-        """提取关键词"""
-        words = jieba.cut(text)
-        # 过滤常见停用词
-        stopwords = {
-            "的",
-            "了",
-            "是",
-            "在",
-            "我",
-            "有",
-            "和",
-            "就",
-            "不",
-            "人",
-            "都",
-            "一",
-            "一个",
-            "上",
-            "也",
-            "很",
-            "到",
-            "说",
-            "要",
-            "去",
-            "你",
-            "会",
-            "着",
-            "没有",
-            "看",
-            "好",
-            "自己",
-            "这",
-        }
-        keywords = [word for word in words if word not in stopwords and len(word) > 1]
-        return keywords
-
-    def _calculate_similarity(self, query, question):
-        """计算两个问题的相似度"""
-        # 方法1: 分词后的关键词重合度
-        query_words = set(self._extract_keywords(query))
-        question_words = set(question.get("keywords", []))
-
-        if not query_words or not question_words:
-            return 0
-
-        # 计算词汇重合度
-        common_words = query_words.intersection(question_words)
-        keyword_similarity = len(common_words) / max(
-            len(query_words), len(question_words)
+        return (
+            list(candidate_indices) if candidate_indices else range(len(self.qa_pairs))
         )
 
-        # 方法2: 字符串相似度
-        string_similarity = difflib.SequenceMatcher(
-            None, query, question["question"]
+    def find_best_match(self, query, threshold=0.47):
+        if not self.qa_pairs or self.tfidf_matrix is None:
+            return None, None, 0.0
+
+        # 步骤1: 初步筛选候选问题
+        candidate_indices = self._get_candidate_indices(query)
+
+        # 步骤2: 计算TF-IDF余弦相似度
+        query_vec = self.vectorizer.transform([query])
+        indices = list(candidate_indices)
+        assert isinstance(self.tfidf_matrix, scipy.sparse.csr_matrix)
+        tfidf_candidates = scipy.sparse.vstack(
+            [self.tfidf_matrix[i] for i in indices]
+        ).tocsr()
+        similarities = cosine_similarity(query_vec, tfidf_candidates)  # type: ignore
+        best_candidate_idx = np.argmax(similarities)
+        best_score = similarities[0, best_candidate_idx]
+        best_qa_idx = indices[best_candidate_idx]
+
+        # 步骤3: 使用编辑距离进行二次验证
+        seq_score = difflib.SequenceMatcher(
+            None, query, self.qa_pairs[best_qa_idx][0]
         ).ratio()
+        # 优化加权方式：TF-IDF与编辑距离0.3:0.7
+        combined_score = 0.3 * best_score + 0.7 * seq_score
 
-        # 综合两种相似度，可以调整权重
-        return 0.7 * keyword_similarity + 0.3 * string_similarity
-
-    def find_best_answer(self, query, threshold=0.3):
-        """查找最匹配的答案"""
-        if not self.qa_data["questions"]:
-            return None
-
-        similarities = [
-            (q, self._calculate_similarity(query, q)) for q in self.qa_data["questions"]
-        ]
-        print(f"相似度: {similarities}")
-        best_match = max(similarities, key=lambda x: x[1])
-        print(f"最佳匹配: {best_match}")
-
-        if best_match[1] >= threshold:
-            return best_match[0]["answer"]
-        return None
-
-    def get_all_qa(self):
-        """获取所有问答对"""
-        return self.qa_data["questions"]
+        if combined_score >= threshold:
+            orig_question, orig_answer = self.qa_pairs[best_qa_idx]
+            return orig_question, orig_answer, combined_score
+        return None, None, combined_score
 
 
-# 演示示例
 if __name__ == "__main__":
-    qa_system = QASystem()
+    matcher = AdvancedQAMatcher()
+    matcher.build_index()
 
-    # 添加问答对示例
-    qa_system.add_qa("如何使用这个问答系统?", "你可以问我任何问题，我会尽力回答!")
-    qa_system.add_qa("群规是什么?", "请大家互相尊重，不要发广告。")
-    qa_system.add_qa("今天天气怎么样?", "我不知道，因为我只是一个本地问答系统。")
-
-    # 测试查询
-    test_queries = ["怎么用这个系统", "群规定是什么", "明天会下雨吗"]
-
-    for query in test_queries:
-        answer = qa_system.find_best_answer(query)
+    while True:
+        query = input("请输入问题: ")
+        orig_question, answer, score = matcher.find_best_match(query)
         print(f"问题: {query}")
-        print(f"回答: {answer if answer else '抱歉，我不知道答案'}")
-        print()
+        if answer:
+            print(f"数据库原句: {orig_question}")
+            print(f"匹配答案: {answer} (相似度: {score:.2f})\n")
+        else:
+            print(f"未找到合适答案 (相似度: {score:.2f})\n")
